@@ -1,0 +1,242 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -37,6 +37,16 @@
+ #define GOODIX_EVENT_REG 0x4180u
+ #define GOODIX_HEAD_LEN  8u
+ #define GOODIX_POINT_LEN 8u
++/* Galaxy A71 (SM-A715F): Samsung sec_ts Y771 on SE7, I2C 0x48. Commands and the
++ * event layout come from the A71 kernel's sec_ts.h / sec_ts.c. */
++#define SEC_ADDR            0x48u
++#define SEC_CMD_SENSE_ON    0x10u
++#define SEC_CMD_TOUCHFUNC   0x30u
++#define SEC_READ_ID         0x52u
++#define SEC_READ_ONE_EVENT  0x60u
++#define SEC_CMD_CLEAR_EVENTS 0x62u
++#define SEC_EVENT_LEN       16u
++#define SEC_TOUCH_FUNCS     0x0061u /* touch | palm | wet, as the stock driver */
+ 
+ #define SE_STATUS       0x040u
+ #define SE_MCLK         0x048u
+@@ -80,6 +90,12 @@
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
++/* A71 backend, off unless boot-arg a71touch=1. */
++static struct {
++	int enabled;
++	unsigned avdd_gpio;  /* TLMM pin of tsp_ldo_avdd (regulator-fixed 3.3 V, active high) */
++	unsigned avdd_tile;  /* physical TLMM tile base holding that pin; 0 = auto-detect */
++} a71 = { 0, 56, 0 };
+ 
+ static uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+@@ -487,6 +503,188 @@
+ 	return 0;
+ }
+ 
++/* ---- Galaxy A71: Samsung sec_ts (Y771) backend --------------------------------- */
++static void
++a71_dump(const char *what, const uint8_t *b, unsigned n)
++{
++	char line[3 * 16 + 1];
++	for (unsigned off = 0; off < n; off += 16) {
++		unsigned m = n - off < 16 ? n - off : 16;
++		for (unsigned j = 0; j < m; ++j) {
++			(void)snprintf(line + j * 3u, 4, "%02x ", b[off + j]);
++		}
++		printf("A71 TOUCH: %s %02x: %s\n", what, off, line);
++	}
++}
++
++/* AVDD is a TLMM GPIO that enables a 3.3 V load switch. The pin lives in one of the
++ * three TLMM tiles; use the boot-arg a71avddtile if given, otherwise read the pin's
++ * config page in each tile and use the only tile where it is non-zero. */
++static bool
++a71_avdd_on(void)
++{
++	static const uint32_t tiles[3] = {0x03900000u, 0x03500000u, 0x03d00000u};
++	const char *names[3] = {"north", "west", "south"};
++	uint32_t pa = 0;
++	if (a71.avdd_tile) {
++		pa = a71.avdd_tile;
++	} else {
++		unsigned hits = 0;
++		for (unsigned i = 0; i < 3; ++i) {
++			vm_offset_t pg = ml_io_map(tiles[i] + a71.avdd_gpio * 0x1000u, 0x1000);
++			if (!pg) {
++				continue;
++			}
++			uint32_t cfg = touch_rd(pg, 0), io = touch_rd(pg, 4);
++			printf("A71 TOUCH: gpio%u in %s tile %#x: cfg=%#x io=%#x\n",
++			    a71.avdd_gpio, names[i], tiles[i], cfg, io);
++			if (cfg != 0) {
++				++hits;
++				pa = tiles[i];
++			}
++		}
++		if (hits != 1) {
++			printf("A71 TOUCH: cannot tell which tile holds gpio%u (%u candidates); "
++			    "set boot-arg a71avddtile; not powering AVDD\n", a71.avdd_gpio, hits);
++			return false;
++		}
++	}
++	vm_offset_t pg = ml_io_map(pa + a71.avdd_gpio * 0x1000u, 0x1000);
++	if (!pg) {
++		printf("A71 TOUCH: cannot map gpio%u page\n", a71.avdd_gpio);
++		return false;
++	}
++	printf("A71 TOUCH: gpio%u tile %#x before: cfg=%#x io=%#x\n", a71.avdd_gpio, pa,
++	    touch_rd(pg, 0), touch_rd(pg, 4));
++	/* Latch high first, then make it an output: plain GPIO, 2 mA, no pull. */
++	touch_wr(pg, 4, touch_rd(pg, 4) | 2u);
++	touch_wr(pg, 0, (touch_rd(pg, 0) & ~0x3ffu) | 0x200u);
++	printf("A71 TOUCH: gpio%u after: cfg=%#x io=%#x (AVDD on)\n", a71.avdd_gpio,
++	    touch_rd(pg, 0), touch_rd(pg, 4));
++	return true;
++}
++
++static int
++a71_cmd(uint8_t c, const uint8_t *arg, unsigned n)
++{
++	uint8_t tx[3] = {c, 0, 0};
++	for (unsigned i = 0; i < n && i < 2; ++i) {
++		tx[1 + i] = arg[i];
++	}
++	return touch_msg(SEC_ADDR, tx, 1u + n, NULL, 0, false);
++}
++
++static int
++a71_start(void)
++{
++	static const uint8_t funcs[2] = {SEC_TOUCH_FUNCS & 0xffu, SEC_TOUCH_FUNCS >> 8};
++	int e1 = a71_cmd(SEC_CMD_TOUCHFUNC, funcs, 2);
++	int e2 = a71_cmd(SEC_CMD_SENSE_ON, NULL, 0);
++	printf("A71 TOUCH: touch-function err=%d sense-on err=%d\n", e1, e2);
++	return e1 ? e1 : e2;
++}
++
++static void
++a71_run(void)
++{
++	uint8_t id[5] = {0}, ev[SEC_EVENT_LEN];
++	int tx[TOUCH_MAX] = {0}, ty[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	unsigned errors = 0, logged = 0;
++
++	/* TLMM 6/7 = qup11 (SE7 SDA/SCL), same mux as the stock A71 pinctrl state. */
++	touch_gpio(6, 1, 0, 0, false, false);
++	touch_gpio(7, 1, 0, 0, false, false);
++	printf("A71 TOUCH: irq gpio9 level=%u (polling, not used)\n",
++	    touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u);
++	if (!a71_avdd_on()) {
++		/* Still probe: the IC may already be powered by an earlier stage. */
++		printf("A71 TOUCH: continuing without AVDD control\n");
++	}
++	touch_wait(70); /* the stock driver waits 70 ms after power-on */
++
++	st.probing = true;
++	int err = touch_read(SEC_ADDR, SEC_READ_ID, false, id, sizeof(id));
++	printf("A71 TOUCH: read id err=%d: %02x %02x %02x %02x %02x (expect 53 45 37 71 00)\n",
++	    err, id[0], id[1], id[2], id[3], id[4]);
++	if (err || id[0] != 0x53 || id[1] != 0x45) {
++		printf("A71 TOUCH: sec_ts not answering at 0x48; stopping\n");
++		st.probing = false;
++		return;
++	}
++	/* Boot-complete is a status event: (b0>>2)&15 == 2, b1 == 0. */
++	bool ready = false;
++	for (unsigned i = 0; i <= 100 && !ready; ++i) {
++		if (!touch_read(SEC_ADDR, SEC_READ_ONE_EVENT, false, ev, SEC_EVENT_LEN)) {
++			ready = ((ev[0] >> 2) & 15u) == 2u && ev[1] == 0;
++		}
++		if (!ready) {
++			touch_wait(20);
++		}
++	}
++	a71_dump("ready event", ev, 8);
++	printf("A71 TOUCH: boot-complete %s\n", ready ? "seen" : "NOT seen; starting anyway");
++	st.probing = false;
++	if (a71_start()) {
++		printf("A71 TOUCH: start failed; stopping\n");
++		return;
++	}
++	printf("A71 TOUCH: polling sec_ts at 0x48, coordinates scaled 4096 -> 1080x2400\n");
++	while (!st.dead) {
++		for (unsigned n = 0; n < 8; ++n) {
++			err = touch_read(SEC_ADDR, SEC_READ_ONE_EVENT, false, ev, SEC_EVENT_LEN);
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("A71 TOUCH: read err=%d (%u)\n", err, errors);
++				}
++				if (errors == 10) {
++					mask = 0;
++					touch_report(0, tx, ty);
++				}
++				break;
++			}
++			errors = 0;
++			if (ev[0] == 0) {
++				break; /* queue empty */
++			}
++			if (logged < 40) {
++				++logged;
++				a71_dump("event", ev, 8);
++			}
++			unsigned eid = ev[0] & 3u;
++			if (eid == 3u) { /* invalid buffer: clear and drop contacts */
++				(void)a71_cmd(SEC_CMD_CLEAR_EVENTS, NULL, 0);
++				mask = 0;
++			} else if (eid == 1u) { /* status; watchdog reset => re-arm the IC */
++				if (((ev[0] >> 2) & 15u) == 2u && ev[1] == 0 && ev[2] == 0x20) {
++					mask = 0;
++					(void)a71_start();
++				}
++			} else if (eid == 0u) { /* coordinate */
++				unsigned tid = (ev[0] >> 2) & 15u, sta = ev[0] >> 6;
++				unsigned ttype = ((unsigned)(ev[6] >> 6) << 2) | (ev[7] >> 6);
++				if (tid < 1u || tid > TOUCH_MAX) {
++					continue;
++				}
++				unsigned t = tid - 1u;
++				unsigned rx = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
++				unsigned ry = ((unsigned)ev[2] << 4) | (ev[3] & 15u);
++				unsigned px = rx * 1080u / 4096u, py = ry * 2400u / 4096u;
++				if (sta == 3u || !(ttype == 0u || ttype == 3u || ttype == 6u)) {
++					mask &= ~(1u << t); /* release, or palm/hover/other */
++				} else if (sta == 1u || sta == 2u) {
++					mask |= 1u << t;
++					tx[t] = (int)(px > 1079u ? 1079u : px);
++					ty[t] = (int)(py > 2399u ? 2399u : py);
++				}
++			}
++		}
++		touch_report(mask, tx, ty);
++		touch_wait(10);
++	}
++	touch_report(0, tx, ty);
++}
++
+ static bool
+ touch_se_init(void)
+ {
+@@ -569,6 +767,10 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (a71.enabled) {
++		a71_run();
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -646,6 +848,9 @@
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	(void)PE_parse_boot_argn("a71touch", &a71.enabled, sizeof(a71.enabled));
++	(void)PE_parse_boot_argn("a71avddgpio", &a71.avdd_gpio, sizeof(a71.avdd_gpio));
++	(void)PE_parse_boot_argn("a71avddtile", &a71.avdd_tile, sizeof(a71.avdd_tile));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
